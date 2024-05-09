@@ -23,8 +23,11 @@ bind_interrupts!(struct Irqs {
 });
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    let mut led = Output::new(p.PIN_25, Level::Low);
+    spawner.spawn(blink_led(led)).unwrap();
 
     let driver = usb::Driver::new(p.USB, Irqs);
     let mut config = Config::new(0x1556, 0xcafe);
@@ -59,6 +62,7 @@ async fn main(_spawner: Spawner) {
             info!("Disconnected");
         }
     };
+
     join(usb_fut, echo_fut).await;
 
     const ADDR: u8 = 0x51;
@@ -67,16 +71,6 @@ async fn main(_spawner: Spawner) {
     let mut status = [0];
     let status = i2c.write_read(ADDR, &[0x1d], &mut status).await.unwrap();
 
-    let mut led = Output::new(p.PIN_25, Level::Low);
-    loop {
-        info!("led on!");
-        led.set_high();
-        Timer::after_secs(1).await;
-
-        info!("led off!");
-        led.set_low();
-        Timer::after_secs(1).await;
-    }
 }
 
 struct Disconnected {}
@@ -97,5 +91,18 @@ async fn echo<'d, T: usb::Instance + 'd>(class: &mut CdcAcmClass<'d, usb::Driver
         let data = &buf[..n];
         info!("data: {:x}", data);
         class.write_packet(data).await?;
+    }
+}
+
+#[embassy_executor::task]
+async fn blink_led(mut led: gpio::Output<'static, impl gpio::Pin + 'static>) {
+    loop {
+        info!("led on!");
+        led.set_high();
+        Timer::after_secs(1).await;
+
+        info!("led off!");
+        led.set_low();
+        Timer::after_secs(1).await;
     }
 }
