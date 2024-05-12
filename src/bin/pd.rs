@@ -12,7 +12,7 @@ use embedded_hal_async::i2c::I2c as I2c_async;
 use embedded_hal_bus::i2c as bus_i2c;
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::join;
 use embassy_rp::{bind_interrupts, gpio, i2c, peripherals, usb};
 use embassy_time::Timer;
 use embassy_usb::{Builder, Config};
@@ -36,10 +36,14 @@ impl<I2C: I2c_block> AP33772<I2C> {
         }
     }
 
-    pub fn read_pdos(&mut self) -> Result<[u8; 28], I2C::Error> {
-        let mut buf = [0; 28];
-        self.i2c.write_read(ADDR, &[0x0], &mut buf)?;
+    pub fn read_buf<const N: usize>(&mut self, wbuf: &[u8]) -> Result<[u8; N], I2C::Error> {
+        let mut buf = [0; N];
+        self.i2c.write_read(ADDR, wbuf, &mut buf)?;
         Ok(buf)
+    }
+
+    pub fn read_pdos(&mut self) -> Result<[u8; 28], I2C::Error> {
+        self.read_buf(&[0x0])
     }
 
     pub fn read_npdos(&mut self) -> Result<u8, I2C::Error> {
@@ -58,6 +62,11 @@ impl<I2C: I2c_block> AP33772<I2C> {
         let mut buf = [0];
         self.i2c.write_read(ADDR, &[0x20], &mut buf)?;
         Ok(buf[0] as u16 * 80)
+    }
+
+    pub fn read_current(&mut self) -> Result<u16, I2C::Error> {
+        let buf = self.read_buf::<1>(&[0x0])?;
+        Ok(buf[0] as u16 * 24)
     }
 
     pub fn read_temp(&mut self) -> Result<u8, I2C::Error> {
@@ -118,20 +127,32 @@ async fn main(spawner: Spawner) {
     //     }
     // };
 
-    let write_fut = async {
+    let (mut sender, mut receiver) = class.split();
+    let read_fut = async {
         let mut buf = [0; 64];
+        loop {
+            let n = receiver.read_packet(&mut buf).await;
+        }
+    };
+
+    let write_fut = async {
         let mut sbuf = itoa::Buffer::new();
         loop {
             // reading seems required to avoid stalling miniterm
-            let n = class.read_packet(&mut buf).await;
-            let temp = pdc.read_voltage().unwrap();
-            class.write_packet(sbuf.format(temp).as_bytes()).await;
-            class.write_packet(b"\n").await;
+            let temp = pdc.read_temp().unwrap();
+            let volt = pdc.read_voltage().unwrap();
+            let curr = pdc.read_current().unwrap();
+            sender.write_packet(sbuf.format(volt).as_bytes()).await;
+            sender.write_packet(b"; ").await;
+            sender.write_packet(sbuf.format(curr).as_bytes()).await;
+            sender.write_packet(b"; ").await;
+            sender.write_packet(sbuf.format(temp).as_bytes()).await;
+            sender.write_packet(b"\n").await;
             Timer::after_secs(1).await;
         }
     };
 
-    join(usb_fut, write_fut).await;
+    join::join3(usb_fut, read_fut, write_fut).await;
 }
 
 struct Disconnected {}
