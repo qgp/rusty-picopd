@@ -5,6 +5,8 @@
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
+use bitvec as bv;
+use bitvec::prelude::*;
 use core::cell::RefCell;
 
 use embedded_hal::i2c::I2c as I2c_block;
@@ -15,9 +17,9 @@ use embassy_executor::Spawner;
 use embassy_futures::join;
 use embassy_rp::{bind_interrupts, gpio, i2c, peripherals, usb};
 use embassy_time::Timer;
-use embassy_usb::{Builder, Config};
-use embassy_usb::driver::EndpointError;
 use embassy_usb::class::cdc_acm;
+use embassy_usb::driver::EndpointError;
+use embassy_usb::{Builder, Config};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<peripherals::USB>;
@@ -28,12 +30,12 @@ const ADDR: u8 = 0x51;
 struct AP33772<I2C> {
     i2c: I2C,
 }
+// cf. register definitions: https://github.com/embassy-rs/embassy/blob/b56a0419bdcec08015b0ba1e4fc137a56720ce72/examples/rp/src/bin/i2c_async.rs#L26
+// C++ library: https://github.com/CentyLab/AP33772-Cpp/blob/main/AP33772.h
 
 impl<I2C: I2c_block> AP33772<I2C> {
     pub fn new(usb_dev: I2C) -> Self {
-        Self {
-            i2c : usb_dev,
-        }
+        Self { i2c: usb_dev }
     }
 
     pub fn read_buf<const N: usize>(&mut self, wbuf: &[u8]) -> Result<[u8; N], I2C::Error> {
@@ -42,8 +44,14 @@ impl<I2C: I2c_block> AP33772<I2C> {
         Ok(buf)
     }
 
-    pub fn read_pdos(&mut self) -> Result<[u8; 28], I2C::Error> {
-        self.read_buf(&[0x0])
+    pub fn read_pdos(&mut self) -> Result<[u32; 7], I2C::Error> {
+        let buf: [u8; 28] = self.read_buf(&[0x0])?;
+        let mut pdos = [0u32; 7];
+        for i in 0..7 {
+            let pdo: &[u8; 4] = &buf[4 * i..4 * (i + 1)].try_into().unwrap();
+            pdos[i] = u32::from_le_bytes(*pdo);
+        }
+        Ok(pdos)
     }
 
     pub fn read_npdos(&mut self) -> Result<u8, I2C::Error> {
@@ -65,7 +73,7 @@ impl<I2C: I2c_block> AP33772<I2C> {
     }
 
     pub fn read_current(&mut self) -> Result<u16, I2C::Error> {
-        let buf = self.read_buf::<1>(&[0x0])?;
+        let buf = self.read_buf::<1>(&[0x21])?;
         Ok(buf[0] as u16 * 24)
     }
 
@@ -73,6 +81,22 @@ impl<I2C: I2c_block> AP33772<I2C> {
         let mut buf = [0];
         self.i2c.write_read(ADDR, &[0x22], &mut buf)?;
         Ok(buf[0])
+    }
+
+    pub fn write_rdo(&mut self) -> Result<(), I2C::Error> {
+        let mut buf = bv::bitarr![u8, bv::prelude::Lsb0; 0; 32];
+        // fixed PDO
+        buf[31..=31].store(0); // reserved
+        buf[28..=30].store(0); // object position
+        buf[20..=27].store(0); // reserved
+        buf[10..=19].store(100); // operating current
+        buf[0..=9].store(100); // max operating current
+        self.i2c.write(ADDR, buf.as_raw_slice())
+    }
+
+    pub fn reset(&mut self) -> Result<(), I2C::Error> {
+        let buf = [0x30, 0, 0, 0, 0];
+        self.i2c.write(ADDR, &buf)
     }
 }
 
@@ -86,7 +110,7 @@ async fn main(spawner: Spawner) {
     let driver = usb::Driver::new(p.USB, Irqs);
     let mut config = Config::new(0x1556, 0xcafe);
     config.manufacturer = Some("qgp.io");
-    config.product = Some("picoALPIDE");
+    config.product = Some("picoPD");
     config.serial_number = Some("12345678");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
@@ -109,6 +133,7 @@ async fn main(spawner: Spawner) {
     let usb_fut = usb.run();
 
     let mut i2c = i2c::I2c::new_async(p.I2C0, p.PIN_1, p.PIN_0, Irqs, i2c::Config::default());
+    // let mut i2c = i2c::I2c::new_blocking(p.I2C0, p.PIN_1, p.PIN_0, i2c::Config::default());
     let i2c_ref_cell = RefCell::new(i2c);
 
     let mut i2c_dev = bus_i2c::RefCellDevice::new(&i2c_ref_cell);
@@ -116,7 +141,9 @@ async fn main(spawner: Spawner) {
     let status = i2c_dev.write_read(ADDR, &[0x1d], &mut status).unwrap();
 
     let mut pdc = AP33772::new(bus_i2c::RefCellDevice::new(&i2c_ref_cell));
-    pdc.read_temp();
+    // info!("Reset");
+    // pdc.reset();
+    // Timer::after_secs(1).await;
 
     // let echo_fut = async {
     //     loop {
@@ -138,17 +165,50 @@ async fn main(spawner: Spawner) {
     let write_fut = async {
         let mut sbuf = itoa::Buffer::new();
         loop {
-            // reading seems required to avoid stalling miniterm
+            let state = pdc.read_status().unwrap();
             let temp = pdc.read_temp().unwrap();
             let volt = pdc.read_voltage().unwrap();
             let curr = pdc.read_current().unwrap();
-            sender.write_packet(sbuf.format(volt).as_bytes()).await;
-            sender.write_packet(b"; ").await;
-            sender.write_packet(sbuf.format(curr).as_bytes()).await;
-            sender.write_packet(b"; ").await;
-            sender.write_packet(sbuf.format(temp).as_bytes()).await;
-            sender.write_packet(b"\n").await;
-            Timer::after_secs(1).await;
+            let npdos = pdc.read_npdos().unwrap();
+            let pdos = pdc.read_pdos().unwrap();
+            info!(
+                "status: b'{:08b}, volt: {} mV, curr: {} mA, temp: {} degC, npdos: {}",
+                state, volt, curr, temp, npdos
+            );
+
+            // sender.write_packet(sbuf.format(volt).as_bytes()).await;
+            // sender.write_packet(b"; ").await;
+            // sender.write_packet(sbuf.format(curr).as_bytes()).await;
+            // sender.write_packet(b"; ").await;
+            // sender.write_packet(sbuf.format(temp).as_bytes()).await;
+            // sender.write_packet(b"; ").await;
+            // sender.write_packet(sbuf.format(npdos).as_bytes()).await;
+            // sender.write_packet(b"\n").await;
+            for i in 0..npdos as usize {
+                if pdos[i] & 0xc000_0000 == 0 {
+                    info!(
+                        "pdo[{}]: 0x{:08x} -> fixed: {} mV, {} mA",
+                        i,
+                        pdos[i],
+                        pdos[i].view_bits::<Lsb0>()[10..20].load::<u32>() * 50,
+                        pdos[i].view_bits::<Lsb0>()[0..10].load::<u32>() * 10,
+                        // (pdos[i] >> 10 & 0x3ff) * 50,
+                        // (pdos[i] & 0x3ff) * 10
+                    );
+                } else if pdos[i] & 0xf000_0000 == 0xc000_0000 {
+                    info!(
+                        "pdo[{}]: 0x{:08x} -> PPS: {} - {} mV, {} mA",
+                        i,
+                        pdos[i],
+                        pdos[i].view_bits::<Lsb0>()[17..=24].load::<u32>() * 100,
+                        pdos[i].view_bits::<Lsb0>()[8..=15].load::<u32>() * 100,
+                        pdos[i].view_bits::<Lsb0>()[0..=6].load::<u32>() * 50,
+                    );
+                }
+                //     sender.write_packet(sbuf.format(pdos[i]).as_bytes()).await;
+                //     sender.write_packet(b"\n").await;
+            }
+            Timer::after_secs(5).await;
         }
     };
 
@@ -166,7 +226,9 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn echo<'d, T: usb::Instance + 'd>(class: &mut cdc_acm::CdcAcmClass<'d, usb::Driver<'d, T>>) -> Result<(), Disconnected> {
+async fn echo<'d, T: usb::Instance + 'd>(
+    class: &mut cdc_acm::CdcAcmClass<'d, usb::Driver<'d, T>>,
+) -> Result<(), Disconnected> {
     let mut buf = [0; 64];
     loop {
         let n = class.read_packet(&mut buf).await?;
@@ -179,11 +241,11 @@ async fn echo<'d, T: usb::Instance + 'd>(class: &mut cdc_acm::CdcAcmClass<'d, us
 #[embassy_executor::task]
 async fn blink_led(mut led: gpio::Output<'static, impl gpio::Pin + 'static>) {
     loop {
-        info!("led on!");
+        // info!("led on!");
         led.set_high();
         Timer::after_secs(1).await;
 
-        info!("led off!");
+        // info!("led off!");
         led.set_low();
         Timer::after_secs(1).await;
     }
