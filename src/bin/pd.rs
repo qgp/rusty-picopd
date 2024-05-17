@@ -2,12 +2,13 @@
 #![no_main]
 #![allow(unused)]
 
+use core::cell::RefCell;
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
+use bitfield::{bitfield, bitfield_bitrange, bitfield_fields};
 use bitvec as bv;
 use bitvec::prelude::*;
-use core::cell::RefCell;
 
 use embedded_hal::i2c::I2c as I2c_block;
 use embedded_hal_async::i2c::I2c as I2c_async;
@@ -27,11 +28,37 @@ bind_interrupts!(struct Irqs {
 });
 
 const ADDR: u8 = 0x51;
+
+bitfield!{
+    pub struct Status(u8);
+    impl Debug;
+    derating, _: 7;
+    otp, _: 6;
+    ocp, _: 5;
+    ovp, _: 4;
+    newpdo, _: 2;
+    success, _: 1;
+    ready, _: 0;
+}
+
+bitfield! {
+    pub struct FixedPDO(u32);
+    impl Debug;
+    vmax, _: 19, 10;
+    imax, _: 9, 0;
+}
+
+bitfield! {
+    pub struct APDO(u32);
+    impl Debug;
+    vmin, _: 24, 17;
+    vmax, _: 15, 8;
+    imax, _: 6, 0;
+}
+
 struct AP33772<I2C> {
     i2c: I2C,
 }
-// cf. register definitions: https://github.com/embassy-rs/embassy/blob/b56a0419bdcec08015b0ba1e4fc137a56720ce72/examples/rp/src/bin/i2c_async.rs#L26
-// C++ library: https://github.com/CentyLab/AP33772-Cpp/blob/main/AP33772.h
 
 impl<I2C: I2c_block> AP33772<I2C> {
     pub fn new(usb_dev: I2C) -> Self {
@@ -137,13 +164,9 @@ async fn main(spawner: Spawner) {
     let i2c_ref_cell = RefCell::new(i2c);
 
     let mut i2c_dev = bus_i2c::RefCellDevice::new(&i2c_ref_cell);
-    let mut status = [0];
-    let status = i2c_dev.write_read(ADDR, &[0x1d], &mut status).unwrap();
-
     let mut pdc = AP33772::new(bus_i2c::RefCellDevice::new(&i2c_ref_cell));
-    // info!("Reset");
-    // pdc.reset();
-    // Timer::after_secs(1).await;
+    Timer::after_secs(1).await;
+    let status_boot = pdc.read_status().unwrap();
 
     // let echo_fut = async {
     //     loop {
@@ -165,17 +188,16 @@ async fn main(spawner: Spawner) {
     let write_fut = async {
         let mut sbuf = itoa::Buffer::new();
         loop {
-            let state = pdc.read_status().unwrap();
+            let status = Status(pdc.read_status().unwrap());
             let temp = pdc.read_temp().unwrap();
             let volt = pdc.read_voltage().unwrap();
             let curr = pdc.read_current().unwrap();
             let npdos = pdc.read_npdos().unwrap();
             let pdos = pdc.read_pdos().unwrap();
             info!(
-                "status: b'{:08b}, volt: {} mV, curr: {} mA, temp: {} degC, npdos: {}",
-                state, volt, curr, temp, npdos
+                "status: b'{:08b}/{:08b}, volt: {} mV, curr: {} mA, temp: {} degC, npdos: {}",
+                status_boot, status.0, volt, curr, temp, npdos
             );
-
             // sender.write_packet(sbuf.format(volt).as_bytes()).await;
             // sender.write_packet(b"; ").await;
             // sender.write_packet(sbuf.format(curr).as_bytes()).await;
@@ -186,14 +208,13 @@ async fn main(spawner: Spawner) {
             // sender.write_packet(b"\n").await;
             for i in 0..npdos as usize {
                 if pdos[i] & 0xc000_0000 == 0 {
+                    let fpdo = FixedPDO(pdos[i]);
                     info!(
                         "pdo[{}]: 0x{:08x} -> fixed: {} mV, {} mA",
                         i,
                         pdos[i],
-                        pdos[i].view_bits::<Lsb0>()[10..20].load::<u32>() * 50,
-                        pdos[i].view_bits::<Lsb0>()[0..10].load::<u32>() * 10,
-                        // (pdos[i] >> 10 & 0x3ff) * 50,
-                        // (pdos[i] & 0x3ff) * 10
+                        fpdo.vmax() * 50,
+                        fpdo.imax() * 10,
                     );
                 } else if pdos[i] & 0xf000_0000 == 0xc000_0000 {
                     info!(
