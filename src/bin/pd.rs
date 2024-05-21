@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 use core::cell::RefCell;
+use core::cmp;
 use defmt::*;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -44,21 +45,52 @@ bitfield! {
 bitfield! {
     pub struct FixedPDO(u32);
     impl Debug;
-    vmax, _: 19, 10;
-    imax, _: 9, 0;
+    v, _: 19, 10; // LSB 50 mV
+    imax, _: 9, 0; // LSB 10 mA
 }
 
 bitfield! {
     pub struct APDO(u32);
     impl Debug;
-    vmax, _: 24, 17;
-    vmin, _: 15, 8;
-    imax, _: 6, 0;
+    vmax, _: 24, 17; // LSB 100 mV
+    vmin, _: 15, 8; // LSB 100 mV
+    imax, _: 6, 0; // LSB 50 mA
 }
 
 enum PDO {
-    FixedPDO(FixedPDO),
-    APDO(APDO),
+    Fixed(FixedPDO),
+    Programmable(APDO),
+}
+
+impl PDO {
+    fn vmin(&self) -> u32 {
+        match self {
+            PDO::Fixed(pdo) => pdo.v() * 50,
+            PDO::Programmable(pdo) => pdo.vmin() * 100,
+        }
+    }
+
+    fn vmax(&self) -> u32 {
+        match self {
+            PDO::Fixed(pdo) => pdo.v() * 50,
+            PDO::Programmable(pdo) => pdo.vmax() * 100,
+        }
+    }
+
+    fn imax(&self) -> u32 {
+        match self {
+            PDO::Fixed(pdo) => pdo.imax() * 10,
+            PDO::Programmable(pdo) => pdo.imax() * 50,
+        }
+    }
+
+    fn vcomp(&self, vmin: u32, vmax: u32) -> bool {
+        (vmin <= self.vmax()) && (self.vmin() <= vmax)
+    }
+
+    fn icomp(&self, imin: u32) -> bool {
+        imin <= self.imax()
+    }
 }
 
 bitfield! {
@@ -93,8 +125,8 @@ impl RDO {
 
 struct AP33772<I2C> {
     i2c: I2C,
-    pdos: [Option<PDO>; 7],
     status: Status,
+    pdos: [Option<PDO>; 7],
 }
 
 impl<I2C: I2c_block> AP33772<I2C> {
@@ -129,9 +161,9 @@ impl<I2C: I2c_block> AP33772<I2C> {
             self.pdos[i] = if pdos[i] == 0x0 {
                 None
             } else if pdos[i] & 0xf000_0000 == 0xc000_0000 {
-                Some(PDO::APDO(APDO(pdos[i])))
+                Some(PDO::Programmable(APDO(pdos[i])))
             } else if pdos[i] & 0xc000_0000 == 0x0 {
-                Some(PDO::FixedPDO(FixedPDO(pdos[i])))
+                Some(PDO::Fixed(FixedPDO(pdos[i])))
             } else {
                 None
             };
@@ -220,24 +252,81 @@ async fn main(spawner: Spawner) {
 
     let mut i2c_dev = bus_i2c::RefCellDevice::new(&i2c_ref_cell);
     let mut pdc = AP33772::new(bus_i2c::RefCellDevice::new(&i2c_ref_cell));
-    Timer::after_secs(1).await;
+    Timer::after_millis(10).await;
     let status_boot = pdc.read_status().unwrap();
     pdc.read_pdos();
 
-    let mut frdo = FixedRDO(0);
-    frdo.pos(2);
-    frdo.i(100);
-    frdo.imax(100);
+    let v_nom = 4200;
+    let v_min = 3300;
+    let v_max = 5000;
+    let i_nom = 2000;
+    let i_min = 1500;
+    let mut ipdo_sel: Option<usize> = None;
+    let mut pdo_sel: Option<&PDO> = None;
+    for (i, pdo_opt) in pdc.pdos.iter().enumerate() {
+        if let Some(pdo) = pdo_opt {
+            info!(
+                "pdo[{}]: {} - {} mV, {} mA",
+                i + 1,
+                pdo.vmin(),
+                pdo.vmax(),
+                pdo.imax(),
+            );
+            if pdo.vcomp(v_min, v_max) && pdo.icomp(i_min) {
+                info!("compatible");
+                match (pdo, pdo_sel) {
+                    (_, None) => {
+                        info!("selecting");
+                        pdo_sel = Some(&pdo);
+                        ipdo_sel = Some(i);
+                    }
+                    (PDO::Programmable(_), Some(PDO::Fixed(_))) => {
+                        info!("selecting");
+                        pdo_sel = Some(&pdo);
+                        ipdo_sel = Some(i);
+                    }
+                    (PDO::Fixed(_), Some(PDO::Fixed(pdo_old))) => {
+                        if pdo.imax() > pdo_old.imax() {
+                            info!("selecting");
+                            pdo_sel = Some(&pdo);
+                            ipdo_sel = Some(i);
+                        }
+                    }
+                    (PDO::Programmable(_), Some(PDO::Programmable(pdo_old))) => {
+                        if pdo.imax() > pdo_old.imax() {
+                            info!("selecting");
+                            pdo_sel = Some(&pdo);
+                            ipdo_sel = Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
-    let mut ardo = ARDO(0);
-    ardo.pos(6);
-    ardo.volt(3360 / 20);
-    ardo.i(1000 / 50);
+    match (pdo_sel, ipdo_sel) {
+        (Some(PDO::Programmable(pdo)), Some(ipdo)) => {
+            let mut ardo = ARDO(0);
+            ardo.pos((ipdo + 1).try_into().unwrap());
+            let v_set = cmp::max(cmp::min(v_nom, v_max), v_min);
+            let i_set = cmp::min(i_nom, pdo.imax() * 50);
+            ardo.volt(v_set / 20);
+            ardo.i(i_set / 50);
+            pdc.write_rdo(&RDO::ARDO(ardo));
+        }
+        (Some(PDO::Fixed(pdo)), Some(ipdo)) => {
+            let mut frdo = FixedRDO(0);
+            frdo.pos((ipdo + 1).try_into().unwrap());
+            let i_set = cmp::min(i_nom, pdo.imax() * 10);
+            frdo.i(i_set / 10);
+            frdo.imax(i_set / 10);
+            pdc.write_rdo(&RDO::FixedRDO(frdo));
+        }
+        _ => {}
+    }
 
-    // let rdo = RDO::FixedRDO(frdo);
-    let rdo = RDO::ARDO(ardo);
-    pdc.write_rdo(&rdo);
-    Timer::after_secs(1).await;
+    Timer::after_millis(100).await;
     pdc.update();
     if pdc.status.ready() && pdc.status.success() {
         info!("Enabling output");
@@ -284,16 +373,16 @@ async fn main(spawner: Spawner) {
             // sender.write_packet(b"\n").await;
             for (i, pdo) in pdc.pdos.iter().enumerate() {
                 match pdo {
-                    Some(PDO::FixedPDO(fpdo)) => {
+                    Some(PDO::Fixed(fpdo)) => {
                         info!(
                             "pdo[{}]: 0x{:08x} -> fixed: {} mV, {} mA",
                             i + 1,
                             fpdo.0,
-                            fpdo.vmax() * 50,
+                            fpdo.v() * 50,
                             fpdo.imax() * 10,
                         );
                     }
-                    Some(PDO::APDO(apdo)) => {
+                    Some(PDO::Programmable(apdo)) => {
                         info!(
                             "pdo[{}]: 0x{:08x} -> PPS: {} - {} mV, {} mA",
                             i + 1,
