@@ -22,13 +22,13 @@ use rusty_picopd::ap33772::regs::*;
 use rusty_picopd::ap33772::*;
 
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
+async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    let mut pwr_en = gpio::Output::new(p.PIN_23, gpio::Level::Low);
+    let pwr_en = gpio::Output::new(p.PIN_23, gpio::Level::Low);
+    let pwr_en_rc = RefCell::new(pwr_en);
     let pdc_irq = gpio::Input::new(p.PIN_24, gpio::Pull::None);
-    let led = gpio::Output::new(p.PIN_25, gpio::Level::Low);
-    spawner.spawn(blink_led(led)).unwrap();
+    let mut led = gpio::Output::new(p.PIN_25, gpio::Level::Low);
 
     let i2c = i2c::I2c::new_async(p.I2C0, p.PIN_1, p.PIN_0, Irqs, i2c::Config::default());
     // let i2c = i2c::I2c::new_blocking(p.I2C0, p.PIN_1, p.PIN_0, i2c::Config::default());
@@ -49,8 +49,8 @@ async fn main(spawner: Spawner) {
     let v_nom = 4400;
     let v_min = 3300;
     let v_max = 5000;
-    let i_nom = 100;
-    let i_min = 100;
+    let i_nom = 1000;
+    let i_min = 1000;
     let mut ipdo_sel: Option<usize> = None;
     let mut pdo_sel: Option<&PDO> = None;
     for (i, pdo_opt) in pdc.pdos.iter().enumerate() {
@@ -67,25 +67,25 @@ async fn main(spawner: Spawner) {
                 match (pdo, pdo_sel) {
                     (_, None) => {
                         info!("selecting");
-                        pdo_sel = Some(&pdo);
+                        pdo_sel = Some(pdo);
                         ipdo_sel = Some(i);
                     }
                     (PDO::Programmable(_), Some(PDO::Fixed(_))) => {
                         info!("selecting");
-                        pdo_sel = Some(&pdo);
+                        pdo_sel = Some(pdo);
                         ipdo_sel = Some(i);
                     }
                     (PDO::Fixed(_), Some(PDO::Fixed(pdo_old))) => {
                         if pdo.imax() > pdo_old.imax() {
                             info!("selecting");
-                            pdo_sel = Some(&pdo);
+                            pdo_sel = Some(pdo);
                             ipdo_sel = Some(i);
                         }
                     }
                     (PDO::Programmable(_), Some(PDO::Programmable(pdo_old))) => {
                         if pdo.imax() > pdo_old.imax() {
                             info!("selecting");
-                            pdo_sel = Some(&pdo);
+                            pdo_sel = Some(pdo);
                             ipdo_sel = Some(i);
                         }
                     }
@@ -118,12 +118,14 @@ async fn main(spawner: Spawner) {
     }
 
     // enable power if negotiation successful
-    Timer::after_millis(100).await;
+    // TODO: wait for interrupt or timeout
+    // futures::select_biased!(_ = pdc_irq.wait_for_high() => {}, _ = Timer::after_millis(100) => {});
     let irq_state = pdc_irq.is_high();
     let _ = pdc.update();
     info!("Status: 0b{:08b} - {}", pdc.status.0, irq_state);
     if pdc.status.ready() && pdc.status.success() {
         info!("Enabling output");
+        let mut pwr_en = pwr_en_rc.borrow_mut();
         pwr_en.set_high();
     }
 
@@ -140,15 +142,16 @@ async fn main(spawner: Spawner) {
             let temp = pdc.read_temp().unwrap();
             let volt = pdc.read_voltage().unwrap();
             let curr = pdc.read_current().unwrap();
-            pdc.update().unwrap();
             let irq_trgd = pdc_irq.is_high();
+            pdc.update().unwrap();
 
             info!(
                 "irq: {}, status: b'{:08b}, volt: {} mV, curr: {} mA, temp: {} degC",
                 irq_trgd, pdc.status.0, volt, curr, temp,
             );
             if pdc.status.ovp() || pdc.status.ocp() || pdc.status.otp() {
-                info!("Switching off power!");
+                info!("Disable output!");
+                let mut pwr_en = pwr_en_rc.borrow_mut();
                 pwr_en.set_low();
             }
             if pdc.status.newpdos() {
@@ -168,16 +171,23 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    join::join(write_fut, update_fut).await;
-}
+    let blink_fut = async {
+        let mut delay_high;
+        let mut delay_low;
+        loop {
+            {
+                let pwr_en = pwr_en_rc.borrow();
+                delay_high = if pwr_en.is_set_high() { 1000 } else { 100 };
+                delay_low = if pwr_en.is_set_high() { 100 } else { 1000 };
+            }
 
-#[embassy_executor::task]
-async fn blink_led(mut led: gpio::Output<'static, impl gpio::Pin + 'static>) {
-    loop {
-        led.set_high();
-        Timer::after_secs(1).await;
+            led.set_high();
+            Timer::after_millis(delay_high).await;
 
-        led.set_low();
-        Timer::after_secs(1).await;
-    }
+            led.set_low();
+            Timer::after_millis(delay_low).await;
+        }
+    };
+
+    join::join3(write_fut, update_fut, blink_fut).await;
 }
