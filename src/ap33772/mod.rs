@@ -20,12 +20,12 @@ impl<I2C: I2c> AP33772<I2C> {
         }
     }
 
-    pub fn update(&mut self) -> Result<(), I2C::Error> {
+    pub fn update(&mut self) -> Result<Status, I2C::Error> {
         self.status.0 = self.read_status()?;
         if self.status.ready() && self.status.newpdos() {
             self.read_pdos()?;
         }
-        Ok(())
+        Ok(Status(self.status.0))
     }
 
     fn read_buf<const N: usize>(&mut self, wbuf: &[u8]) -> Result<[u8; N], I2C::Error> {
